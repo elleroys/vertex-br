@@ -692,10 +692,12 @@ impl WebviewManager {
 
         let mut changed = false;
         for (tab_id, label, discard) in candidates {
+            // Snapshot active ID before locking tab metadata to avoid lock-order inversion.
+            let active_id = self.active_tab_id();
             let still_eligible = {
                 let tabs = self.tabs.lock().unwrap();
                 tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| {
-                    self.active_tab_id().as_deref() != Some(tab.id.as_str())
+                    active_id.as_deref() != Some(tab.id.as_str())
                         && !tab.is_pinned
                         && !tab.is_playing_audio
                         && !tab.has_active_download
@@ -738,13 +740,15 @@ impl WebviewManager {
                 continue;
             }
 
+            let active_id = self.active_tab_id();
             let mut tabs = self.tabs.lock().unwrap();
             if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                if self.active_tab_id().as_deref() == Some(tab.id.as_str())
+                if active_id.as_deref() == Some(tab.id.as_str())
                     || tab.is_pinned
                     || tab.is_playing_audio
                     || tab.has_active_download
                     || is_internal_url(&tab.url)
+                    || (discard && app.get_webview(&label).is_some())
                 {
                     continue;
                 }
