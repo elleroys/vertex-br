@@ -657,7 +657,7 @@ impl WebviewManager {
         }
     }
 
-    /// Memory Saver: призупиняє (`TrySuspend`) або вивантажує (`Discard`) неактивні вкладки.
+    /// Memory Saver applies native lifecycle changes first, then updates tab metadata only on success.
     pub fn apply_memory_saver(
         &self,
         app: &AppHandle,
@@ -666,64 +666,101 @@ impl WebviewManager {
     ) -> bool {
         let now = Utc::now().timestamp_millis();
         let active_id = self.active_tab_id();
-        let mut changed = false;
-        let mut to_discard: Vec<String> = Vec::new();
-        let mut to_suspend: Vec<String> = Vec::new();
+        let mut candidates: Vec<(String, String, bool)> = Vec::new();
 
         {
-            let mut tabs = self.tabs.lock().unwrap();
-            for tab in tabs.iter_mut() {
+            let tabs = self.tabs.lock().unwrap();
+            for tab in tabs.iter() {
                 if Some(tab.id.as_str()) == active_id.as_deref()
                     || tab.is_pinned
                     || tab.is_playing_audio
                     || tab.has_active_download
                     || is_internal_url(&tab.url)
+                    || tab.is_discarded
                 {
                     continue;
                 }
 
                 let idle_secs = (now - tab.last_active_at) / 1000;
-
-                if idle_secs >= discard_after_secs && !tab.is_discarded {
-                    to_discard.push(tab.webview_label.clone());
-                    tab.is_discarded = true;
-                    tab.is_suspended = false;
-                    changed = true;
-                } else if idle_secs >= suspend_after_secs
-                    && !tab.is_suspended
-                    && !tab.is_discarded
-                {
-                    to_suspend.push(tab.webview_label.clone());
-                    tab.is_suspended = true;
-                    changed = true;
+                if idle_secs >= discard_after_secs {
+                    candidates.push((tab.id.clone(), tab.webview_label.clone(), true));
+                } else if idle_secs >= suspend_after_secs && !tab.is_suspended {
+                    candidates.push((tab.id.clone(), tab.webview_label.clone(), false));
                 }
             }
         }
 
-        for label in to_discard {
-            if let Some(wv) = app.get_webview(&label) {
-                let _ = wv.close();
+        let mut changed = false;
+        for (tab_id, label, discard) in candidates {
+            // Snapshot active ID before locking tab metadata to avoid lock-order inversion.
+            let active_id = self.active_tab_id();
+            let still_eligible = {
+                let tabs = self.tabs.lock().unwrap();
+                tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| {
+                    active_id.as_deref() != Some(tab.id.as_str())
+                        && !tab.is_pinned
+                        && !tab.is_playing_audio
+                        && !tab.has_active_download
+                        && !is_internal_url(&tab.url)
+                        && !tab.is_discarded
+                        && (Utc::now().timestamp_millis() - tab.last_active_at) / 1000
+                            >= if discard { discard_after_secs } else { suspend_after_secs }
+                })
+            };
+            if !still_eligible {
+                continue;
             }
-        }
 
-        #[cfg(target_os = "windows")]
-        for label in to_suspend {
-            if let Some(wv) = app.get_webview(&label) {
-                let _ = wv.with_webview(|platform_wv| unsafe {
-                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
-                    use windows::core::Interface;
-                    if let Ok(wv3) = platform_wv
-                        .controller()
-                        .CoreWebView2()
-                        .and_then(|c| c.cast::<ICoreWebView2_3>())
-                    {
-                        let _ = wv3.TrySuspend(None);
-                    }
-                });
+            let native_success = if discard {
+                app.get_webview(&label).is_some_and(|wv| wv.close().is_ok())
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    app.get_webview(&label).is_some_and(|wv| {
+                        wv.with_webview(|platform_wv| unsafe {
+                            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+                            use windows::core::Interface;
+                            platform_wv
+                                .controller()
+                                .CoreWebView2()
+                                .and_then(|core| core.cast::<ICoreWebView2_3>())
+                                .and_then(|wv3| wv3.TrySuspend(None))
+                                .is_ok()
+                        })
+                        .is_ok()
+                    })
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    false
+                }
+            };
+
+            if !native_success {
+                continue;
+            }
+
+            let active_id = self.active_tab_id();
+            let mut tabs = self.tabs.lock().unwrap();
+            if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                if active_id.as_deref() == Some(tab.id.as_str())
+                    || tab.is_pinned
+                    || tab.is_playing_audio
+                    || tab.has_active_download
+                    || is_internal_url(&tab.url)
+                    || (discard && app.get_webview(&label).is_some())
+                {
+                    continue;
+                }
+                if discard {
+                    tab.is_discarded = true;
+                    tab.is_suspended = false;
+                } else {
+                    tab.is_suspended = true;
+                }
+                changed = true;
             }
         }
-        #[cfg(not(target_os = "windows"))]
-        let _ = to_suspend;
 
         changed
     }

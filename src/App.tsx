@@ -543,40 +543,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [activeDownloadsCount, refreshDownloads]);
 
-  // Memory Saver (автоматичне призупинення / вивантаження неактивних вкладок)
-  useEffect(() => {
-    if (settings.memorySaverMode === 'off') return;
-    const interval = setInterval(() => {
-      const now = Date.now();
-      const suspendMs =
-        (settings.memorySaverMode === 'aggressive' ? 2 : settings.memorySaverSuspendMins) * 60_000;
-      const discardMs =
-        (settings.memorySaverMode === 'aggressive' ? 5 : settings.memorySaverDiscardMins) * 60_000;
-
-      setTabs((prev) =>
-        prev.map((t) => {
-          if (
-            t.id === activeTabId ||
-            t.isPinned ||
-            t.isPlayingAudio ||
-            t.hasActiveDownload ||
-            t.url.startsWith('vortex://')
-          ) {
-            return t;
-          }
-          const idle = now - t.lastActiveAt;
-          if (idle >= discardMs && !t.isDiscarded) {
-            return { ...t, isDiscarded: true, isSuspended: false, renderedHtml: undefined };
-          }
-          if (idle >= suspendMs && !t.isSuspended && !t.isDiscarded) {
-            return { ...t, isSuspended: true };
-          }
-          return t;
-        })
-      );
-    }, 30_000);
-    return () => clearInterval(interval);
-  }, [settings.memorySaverMode, settings.memorySaverSuspendMins, settings.memorySaverDiscardMins, activeTabId]);
+  // Memory Saver is managed exclusively by the native WebView lifecycle in Rust.
 
   // Навігація у поточній або новій вкладці
   const navigateTab = useCallback(
